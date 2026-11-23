@@ -1,0 +1,74 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "$0")"
+APP_FILE="$(dirname "$SCRIPT_PATH")/../confs/application.yaml"
+
+# Base packages
+sudo apt-get update -y
+sudo apt-get install -y curl ca-certificates
+
+# Docker
+if ! command -v docker >/dev/null; then
+  curl -fsSL https://get.docker.com | sh
+fi
+sudo usermod -aG docker "$(id -un)"
+
+# Re-run the script with the docker group (active without logging out)
+if ! docker info >/dev/null 2>&1; then
+  [ -z "${IOT_REEXEC:-}" ] || { echo "docker inaccessible"; exit 1; }
+  exec sg docker -c "IOT_REEXEC=1 bash '$SCRIPT_PATH'"
+fi
+
+# k3d
+if ! command -v k3d >/dev/null; then
+  curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+fi
+
+# kubectl
+if ! command -v kubectl >/dev/null; then
+  VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+  curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$VERSION/bin/linux/$(dpkg --print-architecture)/kubectl"
+  sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+fi
+
+# Cluster
+k3d cluster get msn >/dev/null 2>&1 || k3d cluster create msn
+kubectl wait --for=condition=Ready nodes --all --timeout=180s
+
+# Namespaces
+kubectl create namespace argocd 2>/dev/null || true
+kubectl create namespace dev 2>/dev/null || true
+
+# Argo CD (no timeout: waits until everything is ready)
+kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl wait --for=condition=Available deployment --all -n argocd --timeout=-1s
+kubectl rollout status statefulset/argocd-application-controller -n argocd
+
+# Application (Argo CD deploys the app from GitHub)
+kubectl apply -f "$APP_FILE"
+until kubectl get deployment msn-playground -n dev >/dev/null 2>&1; do sleep 2; done
+kubectl wait --for=condition=Available deployment --all -n dev --timeout=-1s
+
+# Port-forwards in background
+pkill -f "port-forward svc/" 2>/dev/null || true
+setsid nohup kubectl port-forward svc/argocd-server -n argocd 8080:443 >/tmp/pf-argocd.log 2>&1 </dev/null &
+setsid nohup kubectl port-forward svc/msn -n dev 8888:8888 >/tmp/pf-app.log 2>&1 </dev/null &
+sleep 3
+
+# Status and password
+ARGO_PWD="$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)"
+
+echo
+echo "==> STATUS"
+echo "--- Nodes";          kubectl get nodes
+echo "--- Pods argocd";    kubectl get pods -n argocd
+echo "--- Application";    kubectl get applications -n argocd
+echo "--- Resources dev";  kubectl get pods,svc -n dev
+
+echo
+echo "Argo CD  : https://localhost:8080"
+echo "Login    : admin"
+echo "Password : $ARGO_PWD"
+
+# kubectl port-forward svc/msn -n dev 8888:8888 &
